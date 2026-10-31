@@ -1,0 +1,67 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The updater against the simtropolis channel just before a maintainer moved SCD3D11 from 0.3.2
+  # to 0.4.4 by hand (sebamarynissen/simtropolis-channel#509). It has to produce the same edit.
+  updater:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FILE: src/yaml/caspervg/37687-scd3d11-dll.yaml
+      URL: https://github.com/caspervg/scd3d11/releases/download/v0.4.4/SCD3D11-v0.4.4.zip
+    steps:
+    - uses: actions/checkout@v5
+    - uses: memo33/sc4pac-actions/actions/setup-lint@main
+    - name: Check out the channel before the manual update
+      run: |
+        git clone --quiet https://github.com/sebamarynissen/simtropolis-channel.git "$RUNNER_TEMP/channel"
+        git -C "$RUNNER_TEMP/channel" checkout --quiet 11106c49ba8c755cf7ec0fd5fe6c1540098dd35b
+    - name: Download the release
+      run: gh release download v0.4.4 -R caspervg/scd3d11 -p SCD3D11-v0.4.4.zip -D "$RUNNER_TEMP/asset"
+    - name: Update
+      run: |
+        python update_metadata.py --channel-dir "$RUNNER_TEMP/channel" --asset-id caspervg-scd3d11 \
+          --version v0.4.4 --url "$URL" --last-modified 2026-10-30T18:20:47Z \
+          --archive "$RUNNER_TEMP/asset/SCD3D11-v0.4.4.zip" --summary "$RUNNER_TEMP/summary.md"
+        cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+    - name: Compare with the manual update
+      working-directory: ${{ runner.temp }}/channel
+      run: |
+        # The maintainer also swapped a screenshot in the same commit; everything else must match.
+        git diff --exit-code -I 'SCD3D11-logo' 6344fe25a72ceff223600940203dcc98e2c1e545 -- "$FILE"
+    - name: Lint
+      working-directory: ${{ runner.temp }}/channel
+      run: sc4pac-lint src/yaml/caspervg
+    - name: A second run changes nothing
+      run: |
+        python update_metadata.py --channel-dir "$RUNNER_TEMP/channel" --asset-id caspervg-scd3d11 \
+          --version v0.4.4 --url "$URL" --last-modified 2026-11-01T00:00:00Z \
+          --archive "$RUNNER_TEMP/asset/SCD3D11-v0.4.4.zip" --report "$RUNNER_TEMP/report.json"
+        test "$(jq .changed "$RUNNER_TEMP/report.json")" = false
+        git -C "$RUNNER_TEMP/channel" diff --exit-code -I 'SCD3D11-logo' 6344fe25a72ceff223600940203dcc98e2c1e545 -- "$FILE"
+
+  # The whole action, without a token, for a release the channel already has.
+  action:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - id: sc4pac
+      uses: ./
+      with:
+        channel: sebamarynissen/simtropolis-channel
+        asset-id: caspervg-scd3d11
+        asset-name: SCD3D11-v0.4.4.zip
+        repository: caspervg/scd3d11
+        tag: v0.4.4
+    - name: Nothing to change
+      env:
+        CHANGED: ${{ steps.sc4pac.outputs.changed }}
+      run: test "$CHANGED" = false

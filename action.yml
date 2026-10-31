@@ -1,0 +1,231 @@
+name: sc4pac release
+description: Prepares a pull request that points a DLL's sc4pac metadata at a new GitHub release.
+
+inputs:
+  channel:
+    description: Channel repository that holds the metadata, such as sebamarynissen/simtropolis-channel or memo33/sc4pac.
+    required: true
+  asset-id:
+    description: The assetId of the release archive in that channel.
+    required: true
+  asset-name:
+    description: File name of the release asset. Needed when the release has more than one .zip.
+    required: false
+  tag:
+    description: Release tag. Defaults to the tag that triggered the workflow.
+    default: ${{ github.ref_name }}
+  repository:
+    description: Repository that holds the release.
+    default: ${{ github.repository }}
+  version:
+    description: Version for sc4pac. Defaults to the tag without its leading v.
+    required: false
+  src-path:
+    description: Folder of the channel's YAML files.
+    default: src/yaml
+  base-branch:
+    description: Branch of the channel to open the pull request against.
+    default: main
+  fork:
+    description: Your fork of the channel. Defaults to the channel's name under the owner of this repository.
+    required: false
+  token:
+    description: >-
+      Token that can push to the fork: a fine-grained token limited to the fork, with Contents read
+      and write, is enough. Without it the action reports the change and stops.
+    required: false
+  open-pull-request:
+    description: >-
+      Also open the pull request instead of linking to a prefilled one. GitHub only allows this
+      with a classic token, which can write to every public repository of its account.
+    default: 'false'
+
+outputs:
+  changed:
+    description: Whether the metadata needed a change for this release.
+    value: ${{ steps.update.outputs.changed }}
+  pull-request:
+    description: URL of the pull request, or of the prefilled form that opens it.
+    value: ${{ steps.pr.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+  # The channels' own linter. It also brings the Python and PyYAML that the updater needs.
+  - uses: memo33/sc4pac-actions/actions/setup-lint@main
+
+  # Drafts and prereleases are not offered to sc4pac users.
+  - name: Find the release asset
+    id: release
+    shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ inputs.repository }}
+      TAG: ${{ inputs.tag }}
+      ASSET_NAME: ${{ inputs.asset-name }}
+    run: |
+      release="$(gh api "repos/$REPOSITORY/releases/tags/$TAG")"
+      if [[ "$(jq -r '.draft or .prerelease' <<<"$release")" == true ]]; then
+        echo "::notice::$TAG is a draft or prerelease, so sc4pac is left alone"
+        echo "skip=true" >> "$GITHUB_OUTPUT"
+        exit 0
+      fi
+      if [[ -n "$ASSET_NAME" ]]; then
+        asset="$(jq -c --arg name "$ASSET_NAME" '[.assets[] | select(.name == $name)]' <<<"$release")"
+      else
+        asset="$(jq -c '[.assets[] | select(.name | test("\\.zip$"; "i"))]' <<<"$release")"
+      fi
+      if [[ "$(jq length <<<"$asset")" != 1 ]]; then
+        echo "::error::Expected one matching asset in $TAG, found: $(jq -r '[.assets[].name] | join(", ")' <<<"$release"). Set asset-name."
+        exit 1
+      fi
+      {
+        echo "name=$(jq -r '.[0].name' <<<"$asset")"
+        echo "url=$(jq -r '.[0].browser_download_url' <<<"$asset")"
+        echo "updated=$(jq -r '.[0].updated_at' <<<"$asset")"
+        echo "digest=$(jq -r '.[0].digest // ""' <<<"$asset")"
+        echo "html-url=$(jq -r '.html_url' <<<"$release")"
+      } >> "$GITHUB_OUTPUT"
+
+  # The public URL is what sc4pac users download, so the checksums are taken from that file.
+  - name: Download the release asset
+    if: steps.release.outputs.skip != 'true'
+    shell: bash
+    env:
+      NAME: ${{ steps.release.outputs.name }}
+      URL: ${{ steps.release.outputs.url }}
+      DIGEST: ${{ steps.release.outputs.digest }}
+    run: |
+      mkdir -p "$RUNNER_TEMP/sc4pac-asset"
+      curl -sSLf -o "$RUNNER_TEMP/sc4pac-asset/$NAME" "$URL"
+      if [[ -n "$DIGEST" && "sha256:$(sha256sum "$RUNNER_TEMP/sc4pac-asset/$NAME" | cut -d' ' -f1)" != "$DIGEST" ]]; then
+        echo "::error::$NAME does not match the digest GitHub reports for it"
+        exit 1
+      fi
+
+  - name: Check out the channel
+    if: steps.release.outputs.skip != 'true'
+    shell: bash
+    env:
+      CHANNEL: ${{ inputs.channel }}
+      BASE: ${{ inputs.base-branch }}
+    run: git clone --quiet --single-branch --branch "$BASE" "https://github.com/$CHANNEL.git" "$RUNNER_TEMP/sc4pac-channel"
+
+  - name: Update the metadata
+    id: update
+    if: steps.release.outputs.skip != 'true'
+    shell: bash
+    env:
+      ASSET_ID: ${{ inputs.asset-id }}
+      VERSION: ${{ inputs.version || inputs.tag }}
+      SRC: ${{ inputs.src-path }}
+      NAME: ${{ steps.release.outputs.name }}
+      URL: ${{ steps.release.outputs.url }}
+      UPDATED: ${{ steps.release.outputs.updated }}
+      RELEASE_URL: ${{ steps.release.outputs.html-url }}
+    run: |
+      status=0
+      python "$GITHUB_ACTION_PATH/update_metadata.py" --channel-dir "$RUNNER_TEMP/sc4pac-channel" --src "$SRC" \
+        --asset-id "$ASSET_ID" --version "$VERSION" --url "$URL" --last-modified "$UPDATED" \
+        --archive "$RUNNER_TEMP/sc4pac-asset/$NAME" --release-url "$RELEASE_URL" \
+        --report "$RUNNER_TEMP/sc4pac-report.json" --summary "$RUNNER_TEMP/sc4pac-summary.md" || status=$?
+      if [[ "$status" != 0 ]]; then
+        cat "$RUNNER_TEMP/sc4pac-summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        exit "$status"
+      fi
+      report="$RUNNER_TEMP/sc4pac-report.json"
+      {
+        echo "changed=$(jq -r .changed "$report")"
+        echo "package=$(jq -r '.packages[0].id // .assetId' "$report")"
+        echo "version=$(jq -r '.version[1]' "$report")"
+        echo "file=$(jq -r .file "$report")"
+      } >> "$GITHUB_OUTPUT"
+      cat "$RUNNER_TEMP/sc4pac-summary.md" >> "$GITHUB_STEP_SUMMARY"
+      { echo; echo '```diff'; git -C "$RUNNER_TEMP/sc4pac-channel" diff; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # The same linter the channel runs on every pull request, with the channel's lint-config.yaml.
+  - name: Lint
+    if: steps.update.outputs.changed == 'true'
+    shell: bash
+    working-directory: ${{ runner.temp }}/sc4pac-channel
+    env:
+      SRC: ${{ inputs.src-path }}
+    run: sc4pac-lint "$SRC"
+
+  # One branch per asset, rebuilt from the channel's current state on every release, so a newer
+  # release replaces an unmerged older one in the same pull request. The version, URL and
+  # checksums go in the commit message, which every release rewrites.
+  - name: Push the branch to the fork
+    id: push
+    if: steps.update.outputs.changed == 'true' && inputs.token != ''
+    shell: bash
+    working-directory: ${{ runner.temp }}/sc4pac-channel
+    env:
+      GH_TOKEN: ${{ inputs.token }}
+      CHANNEL: ${{ inputs.channel }}
+      FORK: ${{ inputs.fork }}
+      ASSET_ID: ${{ inputs.asset-id }}
+      PACKAGE: ${{ steps.update.outputs.package }}
+      VERSION: ${{ steps.update.outputs.version }}
+      OWNER: ${{ github.repository_owner }}
+      OWNER_ID: ${{ github.repository_owner_id }}
+    run: |
+      fork="${FORK:-$OWNER/${CHANNEL#*/}}"
+      branch="sc4pac-release/$ASSET_ID"
+      message="$RUNNER_TEMP/sc4pac-commit.txt"
+      { echo "\`$PACKAGE@$VERSION\`"; echo; cat "$RUNNER_TEMP/sc4pac-summary.md"; } > "$message"
+      gh auth setup-git
+      git switch --quiet -c "$branch"
+      git -c user.name="$OWNER" -c user.email="$OWNER_ID+$OWNER@users.noreply.github.com" commit --quiet -a -F "$message"
+      git push --quiet --force "https://github.com/$fork.git" "HEAD:refs/heads/$branch"
+      echo "fork=$fork" >> "$GITHUB_OUTPUT"
+      echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+  # Opening a pull request in someone else's repository takes a classic token, so by default the
+  # job links to a prefilled one instead. Title and body name no version: the fork-only token
+  # cannot edit them, and the pull request outlives the release it was opened for.
+  - name: Pull request
+    id: pr
+    if: steps.push.outcome == 'success'
+    shell: bash
+    env:
+      GH_TOKEN: ${{ inputs.token }}
+      CHANNEL: ${{ inputs.channel }}
+      BASE: ${{ inputs.base-branch }}
+      FORK: ${{ steps.push.outputs.fork }}
+      BRANCH: ${{ steps.push.outputs.branch }}
+      PACKAGE: ${{ steps.update.outputs.package }}
+      VERSION: ${{ steps.update.outputs.version }}
+      FILE: ${{ steps.update.outputs.file }}
+      OPEN: ${{ inputs.open-pull-request }}
+      REPOSITORY: ${{ inputs.repository }}
+    run: |
+      title="update \`$PACKAGE\`"
+      body="$RUNNER_TEMP/sc4pac-body.md"
+      {
+        echo "Points \`$PACKAGE\` at the latest release of [$REPOSITORY](https://github.com/$REPOSITORY/releases)."
+        echo
+        echo "Each new release replaces the commit on this branch, so its message lists the current version, download URL and checksums."
+      } > "$body"
+      owner="${FORK%%/*}"
+      url="$(gh pr list -R "$CHANNEL" --head "$BRANCH" --author "$owner" --state open --json url --jq '.[0].url // empty')"
+      if [[ -n "$url" ]]; then
+        echo "::notice title=sc4pac::$url now proposes $VERSION"
+      elif [[ "$OPEN" == true ]] && url="$(gh pr create -R "$CHANNEL" --base "$BASE" --head "$owner:$BRANCH" --title "$title" --body-file "$body")"; then
+        echo "::notice title=sc4pac::Opened $url for $VERSION"
+      else
+        url="https://github.com/$CHANNEL/compare/$BASE...$owner:${FORK#*/}:$BRANCH?expand=1&title=$(jq -rn --arg s "$title" '$s|@uri')&body=$(jq -Rrs '@uri' < "$body")"
+        # Workflow commands decode %XX, so the link's own escapes need escaping.
+        echo "::notice title=sc4pac::Open the pull request for $VERSION: ${url//%/%25}"
+      fi
+      echo "url=$url" >> "$GITHUB_OUTPUT"
+      { echo; echo "**sc4pac:** [pull request for $PACKAGE $VERSION]($url)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      # Someone else's open update of the same file, such as a maintainer's manual one, would
+      # conflict with this one. It is not ours to close, so it is only pointed out.
+      others="$(gh pr list -R "$CHANNEL" --state open --limit 100 --json url,author,headRefName,files \
+        --jq "[.[] | select(.headRefName != \"$BRANCH\") | select(any(.files[]; .path == \"$FILE\"))] | map(\"\(.url) by \(.author.login)\") | join(\", \")")"
+      if [[ -n "$others" ]]; then
+        echo "::warning title=sc4pac::Also open on $FILE: $others"
+        echo "Also open on \`$FILE\`: $others" >> "$GITHUB_STEP_SUMMARY"
+      fi
