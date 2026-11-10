@@ -7,7 +7,7 @@ Values are replaced in the source text, so the diff touches nothing but the valu
 and hand-written formatting survives.
 
     python update_metadata.py --channel-dir <checkout> --asset-id <id> --version <v> --url <url>
-                              --last-modified <iso> --archive <file> [--src src/yaml]
+                              --last-modified <iso> --archive <file> [--src src/yaml] [--stex]
                               [--report report.json] [--summary summary.md] [--release-url <url>]
 """
 import argparse
@@ -16,9 +16,14 @@ import json
 import os
 import re
 import sys
+import urllib.request
 import zipfile
+from datetime import datetime, timezone
 
 import yaml
+
+# A Simtropolis file page, as the channels' url-check finds it in nonPersistentUrl or url.
+STEX_FILE_PAGE = re.compile(r"https?://community\.simtropolis\.com/files/file/\d+-[^/?#]+", re.IGNORECASE)
 
 
 class File:
@@ -57,11 +62,12 @@ class Updater:
         self.old_base = base_version(old_version)
         self.new_base = base_version(self.new_version)
         report = self.report
+        last_modified = self.stex_last_modified(asset) if self.args.stex else self.args.last_modified
         report.update(
             file=os.path.relpath(asset_file.path, self.args.channel_dir).replace(os.sep, "/"),
             version=[old_version, None],
             url=[scalar(asset, "url"), self.args.url],
-            lastModified=[scalar(asset, "lastModified"), self.args.last_modified],
+            lastModified=[scalar(asset, "lastModified"), last_modified],
         )
 
         # A job for an older release that finishes after the job for a newer one must not roll
@@ -127,12 +133,17 @@ class Updater:
 
         # When the metadata already describes this release, lastModified stays too. It may hold the
         # time of the Simtropolis upload, which the main channel's update check compares against.
+        # A time read from Simtropolis itself is that upload, so it still corrects a release that
+        # went in with the GitHub time.
         if final_version == old_version and scalar(asset, "url") == self.args.url:
-            report["lastModified"][1] = report["lastModified"][0]
+            if self.args.stex:
+                set_scalar(asset_file, get(asset, "lastModified"), last_modified)
+            else:
+                report["lastModified"][1] = report["lastModified"][0]
             return self.finish([f for f in files if f.edits])
 
         set_scalar(asset_file, get(asset, "version"), final_version)
-        set_scalar(asset_file, get(asset, "lastModified"), self.args.last_modified)
+        set_scalar(asset_file, get(asset, "lastModified"), last_modified)
         set_scalar(asset_file, get(asset, "url"), self.args.url)
         checksum = get(get(asset, "checksum"), "sha256")
         if checksum is not None:
@@ -159,6 +170,27 @@ class Updater:
                     report["renamed"].append({"package": package_id, "field": "info.warning", "from": base_version(old), "to": base_version(final_version)})
 
         return self.finish([f for f in files if f.edits])
+
+    # lastModified as Simtropolis states it. The channels' url-check compares lastModified with the
+    # STEX upload, which comes after the GitHub release, so the time is only taken once that upload
+    # is there: no older than the release archive, and with the release's version.
+    def stex_last_modified(self, asset):
+        source = scalar(asset, "nonPersistentUrl") or scalar(asset, "url") or ""
+        m = STEX_FILE_PAGE.match(source)
+        if not m:
+            fail(f'asset "{self.asset_id}" has no Simtropolis nonPersistentUrl or url, so no STEX upload time applies to it')
+        page = m.group(0) + "/"
+        details = read_stex_page(page, self.args.stex_page)
+        uploaded = parse_time(details["dateModified"], page)
+        released = parse_time(self.args.last_modified, "--last-modified")
+        shown = str(details.get("softwareVersion") or "").strip()
+        if uploaded < released:
+            fail(f"{page} was last updated at {iso_time(uploaded)}, before the release archive ({iso_time(released)}). "
+                 "Upload the release to the STEX first.")
+        if base_version(re.sub(r"^v", "", shown, flags=re.IGNORECASE)).lower() != base_version(self.new_version).lower():
+            fail(f'{page} shows version "{shown}", not {self.new_version}. Upload the release to the STEX first, or correct its version there.')
+        self.report["stex"] = {"page": page, "version": shown, "updated": iso_time(uploaded)}
+        return iso_time(uploaded)
 
     # An include pattern that names a versioned file (`/Setup-0.8.2.exe`) follows the version, but
     # only when the pattern as written no longer matches.
@@ -322,6 +354,49 @@ def compare_versions(a, b):
     return 0
 
 
+# The details of a file from the schema.org JSON-LD on its Simtropolis page. Its dateModified is
+# the upload time that the STEX API reports, without the API's key from the Simtropolis admins.
+# The block is matched on the file ID, because Simtropolis redirects an outdated name in the URL.
+def read_stex_page(url, saved=None):
+    if saved:
+        with open(saved, encoding="utf-8") as fp:
+            html = fp.read()
+    else:
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Firefox/130.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                html = response.read().decode("utf-8", "replace")
+        except OSError as e:
+            fail(f"cannot read {url}: {e}")
+    file_id = stex_file_id(url)
+    for m in re.finditer(r"<script type=['\"]application/ld\+json['\"]>(.*?)</script>", html, re.DOTALL):
+        try:
+            data = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("dateModified") and stex_file_id(str(data.get("url", ""))) == file_id:
+            return data
+    fail(f"{url} states no upload time (schema.org dateModified)")
+
+
+def stex_file_id(url):
+    m = re.search(r"/files/file/(\d+)-", url)
+    return m.group(1) if m else None
+
+
+# Simtropolis writes 2026-11-10T20:13:52+0000, GitHub 2026-11-10T20:13:52Z.
+def parse_time(text, source):
+    try:
+        return datetime.strptime(text.strip(), "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        fail(f"{source}: unexpected time {text!r}")
+
+
+# The form the channels write lastModified in.
+def iso_time(t):
+    return t.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # The sha256 of every file in a ZIP archive, keyed by its sc4pac path ('/dir/file.dll').
 def read_zip(path):
     try:
@@ -341,6 +416,9 @@ def summarize(r, release_url):
     for key in ("version", "lastModified", "url"):
         lines.append(f"| {key} | {r[key][0]} | {r[key][1]} |")
     lines.append("")
+    if r.get("stex"):
+        s = r["stex"]
+        lines += [f'lastModified is the time of the upload of {s["version"]} to [Simtropolis]({s["page"]}).', ""]
     if r["checksums"]:
         lines += ["Checksums of the files sc4pac installs, computed from the release archive:", ""]
         lines += ["| File | sha256 | |", "|---|---|---|"]
@@ -353,7 +431,11 @@ def summarize(r, release_url):
     return "\n".join(lines) + "\n"
 
 
+# In a workflow the message also becomes an annotation, so it shows on the run's page.
 def fail(message):
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print(f"::error title=sc4pac::{escaped}")
     print(f"error: {message}", file=sys.stderr)
     sys.exit(1)
 
@@ -367,6 +449,9 @@ def main():
     parser.add_argument("--url", required=True, help="download URL of the release archive")
     parser.add_argument("--last-modified", required=True, help="upload time of the archive, e.g. 2026-10-30T13:38:52Z")
     parser.add_argument("--archive", required=True, help="local copy of the file at --url")
+    parser.add_argument("--stex", action="store_true",
+                        help="take lastModified from the asset's Simtropolis page instead; --last-modified must then be the release time, which the upload may not be older than")
+    parser.add_argument("--stex-page", help="read this saved copy of the Simtropolis page instead of downloading it")
     parser.add_argument("--report", help="write a JSON report here")
     parser.add_argument("--summary", help="write a Markdown summary here")
     parser.add_argument("--release-url", help="release page to link from the summary")
