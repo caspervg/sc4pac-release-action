@@ -20,7 +20,7 @@ It also:
 - skips drafts and prereleases,
 - verifies the downloaded archive against the digest GitHub reports for it,
 - never moves a channel back to an older version,
-- does nothing when the channel already describes the release, and then leaves `lastModified` alone too,
+- does nothing when the channel already describes the release, and then leaves `lastModified` alone too (with `last-modified: stex` it still corrects a `lastModified` that differs from the STEX),
 - adds a `-1` release suffix when the same version is released again with different files,
 - warns about a DLL, ASI, EXE or INI in the archive that no package installs.
 
@@ -67,6 +67,38 @@ Add a job after the one that publishes the release:
 
 Use a `needs:` job rather than a separate `on: release` workflow: a release created with the workflow's own `GITHUB_TOKEN` doesn't trigger other workflows.
 
+### Packages that are also on the STEX
+
+A channel's `url-check` (as in sebamarynissen/simtropolis-channel) compares an asset's `lastModified` with the upload on Simtropolis when the asset has a STEX `nonPersistentUrl`. They may differ by 10 minutes at most. The GitHub release comes first, and the STEX upload later, so the release's time fails that check.
+
+For such a package, run the action by hand after the STEX upload, with `last-modified: stex`. It reads the upload time from the file's Simtropolis page (the schema.org data on it, so no STEX API key is needed). It stops with an error, and changes nothing, while that page shows an upload older than the release or a version other than the release's. A leading `v` on either version is ignored.
+
+```yaml
+name: sc4pac
+
+# Run from the release tag after the STEX upload: Actions → sc4pac → Run workflow → Use workflow
+# from → Tags → v1.2.0, or `gh workflow run sc4pac.yml --ref v1.2.0`.
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  sc4pac:
+    runs-on: ubuntu-latest
+    environment: sc4pac
+    concurrency: sc4pac-caspervg-scd3d11
+    steps:
+    - uses: caspervg/sc4pac-release-action@v1
+      with:
+        channel: sebamarynissen/simtropolis-channel
+        asset-id: caspervg-scd3d11
+        last-modified: stex
+        token: ${{ secrets.SC4PAC_FORK_TOKEN }}
+```
+
+Run from a tag, the run's `github.ref_name` is that tag, so `tag` needs no input, and an environment that only allows `v*` tags still guards the token. The workflow file must be in the tagged commit.
+
 ### Inputs
 
 | Input | Default | |
@@ -77,6 +109,7 @@ Use a `needs:` job rather than a separate `on: release` workflow: a release crea
 | `tag` | the triggering tag | Release tag. |
 | `repository` | this repository | Repository that holds the release. |
 | `version` | the tag without its `v` | Version for sc4pac. |
+| `last-modified` | `release` | `release`: the upload time of the archive on GitHub. `stex`: the upload time on the asset's Simtropolis page; see [Packages that are also on the STEX](#packages-that-are-also-on-the-stex). |
 | `src-path` | `src/yaml` | Folder of the channel's YAML files. |
 | `base-branch` | `main` | Branch of the channel to target. |
 | `fork` | `<owner>/<channel name>` | Your fork of the channel. |
@@ -99,6 +132,8 @@ python update_metadata.py --channel-dir simtropolis-channel --asset-id caspervg-
   --version v0.4.4 --url https://github.com/caspervg/scd3d11/releases/download/v0.4.4/SCD3D11-v0.4.4.zip \
   --last-modified 2026-10-30T18:18:43Z --archive SCD3D11-v0.4.4.zip --summary summary.md
 ```
+
+Add `--stex` to take `lastModified` from the asset's Simtropolis page. `--last-modified` is then the release's time, which the upload may not be older than.
 
 ## Packages in memo33/sc4pac
 

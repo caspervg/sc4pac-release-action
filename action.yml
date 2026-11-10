@@ -20,6 +20,13 @@ inputs:
   version:
     description: Version for sc4pac. Defaults to the tag without its leading v.
     required: false
+  last-modified:
+    description: >-
+      Where the asset's lastModified comes from. release: the upload time of the archive on GitHub.
+      stex: the upload time on the asset's Simtropolis page (its nonPersistentUrl), for a channel
+      whose url-check compares lastModified with the STEX. Run the action after the STEX upload
+      then; it fails while Simtropolis shows an upload older than the release or another version.
+    default: release
   src-path:
     description: Folder of the channel's YAML files.
     default: src/yaml
@@ -123,10 +130,16 @@ runs:
       URL: ${{ steps.release.outputs.url }}
       UPDATED: ${{ steps.release.outputs.updated }}
       RELEASE_URL: ${{ steps.release.outputs.html-url }}
+      LAST_MODIFIED: ${{ inputs.last-modified }}
     run: |
+      case "$LAST_MODIFIED" in
+        release) stex=() ;;
+        stex) stex=(--stex) ;;
+        *) echo "::error::last-modified must be release or stex, not '$LAST_MODIFIED'"; exit 1 ;;
+      esac
       status=0
       python "$GITHUB_ACTION_PATH/update_metadata.py" --channel-dir "$RUNNER_TEMP/sc4pac-channel" --src "$SRC" \
-        --asset-id "$ASSET_ID" --version "$VERSION" --url "$URL" --last-modified "$UPDATED" \
+        --asset-id "$ASSET_ID" --version "$VERSION" --url "$URL" --last-modified "$UPDATED" "${stex[@]}" \
         --archive "$RUNNER_TEMP/sc4pac-asset/$NAME" --release-url "$RELEASE_URL" \
         --report "$RUNNER_TEMP/sc4pac-report.json" --summary "$RUNNER_TEMP/sc4pac-summary.md" || status=$?
       if [[ "$status" != 0 ]]; then

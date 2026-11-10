@@ -48,6 +48,52 @@ jobs:
         test "$(jq .changed "$RUNNER_TEMP/report.json")" = false
         git -C "$RUNNER_TEMP/channel" diff --exit-code -I 'SCD3D11-logo' 6344fe25a72ceff223600940203dcc98e2c1e545 -- "$FILE"
 
+  # lastModified from the STEX: SCD3D11 0.5.0 was released at 20:02:43 and uploaded to Simtropolis
+  # at 20:13:52, and the channel's url-check wanted the second (sebamarynissen/simtropolis-channel#558).
+  # tests/stex-37687.html is the JSON-LD of that Simtropolis page after the upload.
+  stex:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FILE: src/yaml/caspervg/37687-scd3d11-dll.yaml
+    steps:
+    - uses: actions/checkout@v5
+    - uses: memo33/sc4pac-actions/actions/setup-lint@main
+    - name: Check out the channel at 0.4.7
+      run: |
+        git clone --quiet https://github.com/sebamarynissen/simtropolis-channel.git "$RUNNER_TEMP/channel"
+        git -C "$RUNNER_TEMP/channel" checkout --quiet 9b301b15ebf5070e16883abf935be2bafca336a8
+    - name: Download the release
+      run: gh release download v0.5.0 -R caspervg/scd3d11 -p SCD3D11-v0.5.0.zip -D "$RUNNER_TEMP/asset"
+    - name: Update
+      run: |
+        update() {
+          python update_metadata.py --channel-dir "$RUNNER_TEMP/channel" --asset-id caspervg-scd3d11 \
+            --url https://github.com/caspervg/scd3d11/releases/download/v0.5.0/SCD3D11-v0.5.0.zip \
+            --archive "$RUNNER_TEMP/asset/SCD3D11-v0.5.0.zip" --stex --stex-page tests/stex-37687.html "$@"
+        }
+        # An upload older than the release, or of another version, is not the release's upload.
+        # (set -e ignores a command negated with !, hence the ifs.)
+        if update --version v0.5.0 --last-modified 2026-11-10T20:30:00Z; then exit 1; fi
+        if update --version v0.5.1 --last-modified 2026-11-10T20:02:43Z; then exit 1; fi
+        git -C "$RUNNER_TEMP/channel" diff --exit-code
+
+        update --version v0.5.0 --last-modified 2026-11-10T20:02:43Z --summary "$RUNNER_TEMP/summary.md"
+        cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+        grep -qx 'lastModified: "2026-11-10T20:13:52Z"' "$RUNNER_TEMP/channel/$FILE"
+        grep -qx 'version: "0.5.0"' "$RUNNER_TEMP/channel/$FILE"
+
+        # A release that went in with the GitHub time gets only its lastModified corrected.
+        sed -i 's/^lastModified: .*/lastModified: "2026-11-10T20:02:43Z"/' "$RUNNER_TEMP/channel/$FILE"
+        git -C "$RUNNER_TEMP/channel" -c user.name=test -c user.email=test@example.com commit --quiet -a -m merged
+        update --version v0.5.0 --last-modified 2026-11-10T20:02:43Z --report "$RUNNER_TEMP/report.json"
+        test "$(jq .changed "$RUNNER_TEMP/report.json")" = true
+        test "$(git -C "$RUNNER_TEMP/channel" diff --numstat | cut -f1,2)" = "$(printf '1\t1')"
+        grep -qx 'lastModified: "2026-11-10T20:13:52Z"' "$RUNNER_TEMP/channel/$FILE"
+    - name: Lint
+      working-directory: ${{ runner.temp }}/channel
+      run: sc4pac-lint src/yaml/caspervg
+
   # The whole action, without a token, for a release the channel already has.
   action:
     runs-on: ubuntu-latest
